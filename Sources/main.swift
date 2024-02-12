@@ -77,6 +77,8 @@ group.stateUpdateHandler = { newState in
             return
         }
 
+        var isMainDone = false
+        var isSecondaryDone = false
         mainConn.stateUpdateHandler = { state in
                 print("Main Connection State: \(state)")
             switch state {
@@ -122,8 +124,11 @@ group.stateUpdateHandler = { newState in
                         switch $0 {
                         case .ready:
                             nextConn.send(content: Data(count: 4), contentContext: .finalMessage, isComplete: true, completion: .contentProcessed({_ in
-                                print("Connection finished")
-                                group.cancel()
+                                isMainDone = true
+                                if isMainDone && isSecondaryDone {
+                                    print("[main] Connection finished")
+                                    group.cancel()
+                                }
                             }))
                         default:
                             break
@@ -158,6 +163,27 @@ group.stateUpdateHandler = { newState in
         }
         // Don't forget to start the connection.
         mainConn.start(queue: queue)
+
+        options.direction = .unidirectional
+
+        let secondaryConn = group.extract(using: options)!
+        secondaryConn.start(queue: queue)
+
+        secondaryConn.stateUpdateHandler = { connState in
+            print("Secondary connection state: \(connState)")
+            switch connState {
+                case .ready:
+                    secondaryConn.send(content: Data(count: 5), contentContext: .finalMessage, isComplete: true, completion: .contentProcessed {_ in
+                            isSecondaryDone = true
+                            if isMainDone && isSecondaryDone {
+                                print("[secondary] Connection finished")
+                                group.cancel()
+                            }
+                    })
+                default:
+                    break
+            }
+        }
     default:
         break
     }

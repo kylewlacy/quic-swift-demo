@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use tracing::Instrument as _;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -59,53 +60,73 @@ async fn main() -> eyre::Result<()> {
                     "Received new stream",
                 );
 
-                tokio::task::spawn(async move {
-                    let mut buf = vec![0; 4];
-                    rx.read_exact(&mut buf).await.inspect_err(|err| {
-                        tracing::error!("Failed to read from stream: {err:#}");
-                    })?;
-                    tracing::info!("Received: {buf:?}");
+                let mut secondary = conn.accept_uni().await.inspect_err(|err| {
+                    tracing::error!("Failed to accept secondary connection: {err:#}");
+                })?;
 
-                    tx.write_all(b"Hello, world!")
-                        .await
-                        .inspect_err(|err| tracing::error!("Failed to write to stream: {err:#}"))?;
-                    tx.finish().await.inspect_err(|err| {
-                        tracing::error!("Failed to finish stream: {err:#}");
-                    })?;
+                let primary_task = tokio::task::spawn({
+                    let conn = conn.clone();
+                    async move {
+                        let mut buf = vec![0; 4];
+                        rx.read_exact(&mut buf).await.inspect_err(|err| {
+                            tracing::error!("Failed to read from stream: {err:#}");
+                        })?;
+                        tracing::info!("Received: {buf:?}");
 
-                    tracing::info!("Wrote to stream");
+                        tx.write_all(b"Hello, world!")
+                            .await
+                            .inspect_err(|err| tracing::error!("Failed to write to stream: {err:#}"))?;
+                        tx.finish().await.inspect_err(|err| {
+                            tracing::error!("Failed to finish stream: {err:#}");
+                        })?;
 
-                    match rx.read_to_end(0).await {
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::error!("Failed to read end of stream: {error:#}");
-                            let _ = rx.stop(0u8.into()).inspect_err(|err| {
-                                tracing::warn!("Failed to manually stop stream: {err:#}");
-                            });
+                        tracing::info!("Wrote to stream");
+
+                        match rx.read_to_end(0).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!("Failed to read end of stream: {error:#}");
+                                let _ = rx.stop(0u8.into()).inspect_err(|err| {
+                                    tracing::warn!("Failed to manually stop stream: {err:#}");
+                                });
+                            }
                         }
-                    }
 
-                    tracing::info!("Closed stream");
+                        tracing::info!("Closed stream");
 
-                    let (mut next_tx, mut next) = conn.accept_bi().await.inspect_err(|err| {
-                        tracing::error!("Failed to accept new stream: {err:#}");
+                        let (mut next_tx, mut next) = conn.accept_bi().await.inspect_err(|err| {
+                            tracing::error!("Failed to accept new stream: {err:#}");
+                        })?;
+                        next_tx.finish().await.inspect_err(|err| {
+                            tracing::error!("Failed to finish stream: {err:#}");
+                        })?;
+
+                        tracing::info!("Accepted next stream");
+
+                        let data = next.read_to_end(4).await.inspect_err(|err| {
+                            tracing::error!("Failed to read from stream: {err:#}");
+                        })?;
+                        tracing::info!("Received: {data:?}");
+
+                        eyre::Ok(())
+                    }.instrument(tracing::info_span!("primary"))
+                });
+
+                let secondary_task = tokio::task::spawn(async move {
+                    let data = secondary.read_to_end(5).await.inspect_err(|err| {
+                        tracing::error!("Failed to read from secondary stream: {err:#}");
                     })?;
-                    next_tx.finish().await.inspect_err(|err| {
-                        tracing::error!("Failed to finish stream: {err:#}");
-                    })?;
-
-                    tracing::info!("Accepted next stream");
-
-                    let data = next.read_to_end(4).await.inspect_err(|err| {
-                        tracing::error!("Failed to read from stream: {err:#}");
-                    })?;
-                    tracing::info!("Received: {data:?}");
-
-                    tracing::info!("Connection finished");
-                    conn.close(0u8.into(), b"Done");
+                    tracing::info!("Received secondary: {data:?}");
 
                     eyre::Ok(())
                 });
+
+                let (primary_task, secondary_task) = tokio::try_join!(primary_task, secondary_task)?;
+                primary_task?;
+                secondary_task?;
+
+                tracing::info!("Connection finished");
+                conn.close(0u8.into(), b"Done");
 
                 eyre::Ok(())
             });
